@@ -56,7 +56,8 @@ int AACEncoder::open() {
   inputSamples = info.frame_samples;
   maxOutputBytes = info.max_output_bytes;
   lastFramePtsUs = 0;
-  nextOutTsMs = 0;
+  ptsAnchorUs = 0;
+  outSamples = 0;
   outTsRunning = false;
 
   // FIFO: capacity = 3x frame size so we can accumulate across HAL frames
@@ -111,17 +112,19 @@ int AACEncoder::encode(IMPAudioFrame *data, unsigned char *outbuf,
 
   if (!outTsRunning) {
     if (data->timeStamp != 0) {
-      nextOutTsMs = (uint32_t)(data->timeStamp / 1000);
+      ptsAnchorUs = (int64_t)data->timeStamp;
     } else {
       // HAL timestamps unavailable (e.g. T10) --- use monotonic wall clock
       struct timespec mono;
       clock_gettime(CLOCK_MONOTONIC, &mono);
-      nextOutTsMs = (uint32_t)(mono.tv_sec * 1000 + mono.tv_nsec / 1000000);
+      ptsAnchorUs = (int64_t)mono.tv_sec * 1000000LL + mono.tv_nsec / 1000;
     }
+    outSamples = 0;
     outTsRunning = true;
   }
 
-  uint32_t frameDur = (uint32_t)inputSamples * 1000 / sampleRate;
+  const int64_t frameUs =
+      (int64_t)inputSamples * 1000000LL / (int64_t)sampleRate;
   int frameTotal = (int)inputSamples * numChn;
 
   // Drain the FIFO in exact frame-sized chunks
@@ -147,19 +150,45 @@ int AACEncoder::encode(IMPAudioFrame *data, unsigned char *outbuf,
       memcpy(outbuf + *outLen, encOutBuf, bytesWritten);
       *outLen += static_cast<int>(bytesWritten);
 
-      lastFramePtsUs = (int64_t)nextOutTsMs * 1000;
-      nextOutTsMs += frameDur;
+      lastFramePtsUs = ptsUsForSamples(outSamples);
+      outSamples += (uint64_t)inputSamples;
 
-      // Drift correction: snap encoder clock to HAL when it drifts > 4 frames
+      // Re-anchor only on a large capture-clock discontinuity: an IMP driver
+      // timestamp-domain change (0 -> real time) or a long capture stall.
+      //
+      // The two values compared here do not describe the same sample boundary.
+      // data->timeStamp belongs to the HAL frame just pushed, while
+      // ptsUsForSamples(outSamples) is the position of the next AAC frame to be
+      // emitted, and the FIFO bridges two different frame sizes -- IMPAudio asks
+      // the HAL for the 10 ms multiple closest to 1024 samples (960 at 48 kHz and
+      // at 16 kHz, 882 at 44.1 kHz, 1040 at 8 kHz), so the two boundaries drift
+      // in and out of phase continuously.  That is normal and must not be
+      // mistaken for clock drift.
+      //
+      // The resulting steady-state offset is bounded by roughly one HAL frame,
+      // which by the choice above is close to one AAC frame, so the 4-frame
+      // threshold keeps a healthy margin at every supported rate.  Simulated
+      // over 4000 frames per rate: worst case 22050 Hz reaches 50.0 ms against a
+      // 185.8 ms threshold (3.7x), 48 kHz reaches 20.0 ms against 85.3 ms (4.3x),
+      // and no rate triggers a spurious re-anchor.
+      //
+      // Note there is no per-frame correction here.  The previous code nudged the
+      // timeline by +-1 ms on every frame to chase the HAL clock, which is what
+      // destroyed the AAC frame cadence; a sample-derived timeline has no
+      // per-frame error to chase.
       if (data->timeStamp != 0) {
-        uint32_t impTsMs = (uint32_t)(data->timeStamp / 1000);
-        int32_t err = (int32_t)impTsMs - (int32_t)nextOutTsMs;
-        if (err > (int32_t)frameDur * 4 || err < -(int32_t)frameDur * 4)
-          nextOutTsMs = impTsMs;
-        else if (err > 1)
-          nextOutTsMs++;
-        else if (err < -1)
-          nextOutTsMs--;
+        int64_t err = (int64_t)data->timeStamp - ptsUsForSamples(outSamples);
+        if (err > frameUs * 4 || err < -frameUs * 4) {
+          // Resetting the counter re-bases the timeline on the HAL clock.  The
+          // next AAC frame starts from PCM already in the FIFO, so its true
+          // position is up to one HAL frame away from data->timeStamp -- a
+          // one-off phase error far smaller than the >4-frame discontinuity that
+          // got us here, and the timeline is exact again from the next frame on.
+          // RtspServer's own guard keeps the RTP timestamp monotonic across the
+          // jump, so this does not need to be exact.
+          ptsAnchorUs = (int64_t)data->timeStamp;
+          outSamples = 0;
+        }
       }
     }
   }

@@ -106,9 +106,27 @@ private:
   // Heap-allocated output buffer (avoids MIPS stack overflow from 16KB on stack)
   uint8_t *encOutBuf = nullptr;
 
-  // Smooth output timestamp
-  uint32_t nextOutTsMs = 0;
+  // Output timeline, derived from the cumulative encoded sample count.  FAAC
+  // frame boundaries do not line up with the HAL's input frames (the HAL may
+  // deliver 960 samples while FAAC emits 1024), so the encoder needs its own
+  // timeline rather than reusing the capture timestamp.  Counting samples keeps
+  // it exact: a frame is inputSamples/sampleRate seconds, which is 21.3333 ms
+  // for 1024 @ 48 kHz and therefore not representable in whole milliseconds.
+  int64_t ptsAnchorUs = 0;  // capture time of the first frame after (re-)anchoring
+  uint64_t outSamples = 0;  // encoded samples emitted since that anchor
   bool outTsRunning = false;
+
+  // Presentation time of the frame at the given cumulative sample offset.
+  // Rounds to nearest microsecond instead of truncating, so the sequence for
+  // 1024 @ 48 kHz is 0, 21333, 42667, 64000, 85333, 106667, ... and converting
+  // it back to a 48 kHz RTP clock reproduces exact 1024-tick steps.
+  int64_t ptsUsForSamples(uint64_t samples) const {
+    if (sampleRate <= 0)
+      return ptsAnchorUs;
+    const uint64_t rate = static_cast<uint64_t>(sampleRate);
+    return ptsAnchorUs +
+           static_cast<int64_t>((samples * 1000000ULL + rate / 2) / rate);
+  }
 };
 #endif
 

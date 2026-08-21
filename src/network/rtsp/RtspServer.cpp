@@ -2264,8 +2264,14 @@ bool RtspServer::sendAudioFrame(Session &s, const AudioFrame &af) {
             dtUs = 1000;
         }
         if (dtUs < 0) dtUs = 0;
+        // Map presentation time onto the codec's RTP clock, rounding to the
+        // nearest tick rather than truncating.  dtUs is clamped to >= 0 just
+        // above, so biasing by half a tick is safe.  Given a frame PTS with
+        // sub-millisecond precision this reproduces the codec's exact frame
+        // cadence -- 1024 ticks per AAC-LC frame at 48 kHz -- without the RTP
+        // layer needing to know anything about frame sizes.
         uint32_t new_ts = static_cast<uint32_t>(
-            dtUs * static_cast<int64_t>(sampleRate) / 1000000LL);
+            (dtUs * static_cast<int64_t>(sampleRate) + 500000LL) / 1000000LL);
         // Guard against forward timestamp jumps (e.g. IMP driver timestamp
         // domain transition from 0->real-time).  Cap the step to 500 ms of
         // audio; larger jumps are treated as a discontinuity and the RTP
